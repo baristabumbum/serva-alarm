@@ -1,0 +1,209 @@
+# Serva çalışma süresi alarmı (Telegram). Kurulum: docs/deployment/ALARM-KURULUM.md
+#
+# BU DOSYA BU DEPODA ÇALIŞTIRILMAZ. Bilerek .github/workflows/ DIŞINDA durur.
+# Neden: ana depo ÖZEL; özel depoda GitHub ayda yalnız 2.000 Actions dakikası verir.
+# Her 5 dakikada bir koşu ayda ~8.600 dakika eder ve yayın iş akışını (vps-image.yml) tıkardı.
+# Çözüm: bu dosyayı AYRI, HERKESE AÇIK küçük bir depoya koy (herkese açık depoda dakika
+# ücretsiz). İçinde sır yok, yalnız herkese açık adresleri yoklar. Adımlar: ALARM-KURULUM.md.
+#
+# - Her 5 dakikada bir yoklar. GitHub zamanlayıcısı SÖZ VERMEZ: yoğun saatlerde
+#   çalışma 5-15 dakika (nadiren daha fazla) gecikebilir, bazı tetiklemeler atlanabilir.
+#   Yani gerçek "fark etme süresi" tipik olarak 10-20 dakikadır, saniyelik değil.
+# - ZAMANLANMIŞ iş akışları yalnız o deponun VARSAYILAN dalından (main) çalışır.
+# - Bağımsızdır (depoyu çekmez), quality.yml / vps-image.yml'e dokunmaz.
+# - TELEGRAM_BOT_TOKEN ve TELEGRAM_CHAT_ID sırları yoksa iş akışı kırmızı olmaz:
+#   yoklar, sonucu günlüğe yazar, mesaj göndermez.
+# - Herkese açık depoda 60 gün etkinlik olmazsa GitHub zamanlanmış işi kapatır; son adım
+#   iş akışını kendi kendine yeniden "enable" ederek bunu önler (actions: write).
+name: Uptime alarm
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_mesaji:
+        description: "Telegram'a bir deneme mesajı gönder (kurulumu denemek için)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write # yalnız durum önbelleğini yazmak için
+
+concurrency:
+  group: uptime-alarm
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Önceki durumu geri yükle
+        uses: actions/cache/restore@v4
+        with:
+          path: alarm-state/state.env
+          key: alarm-state-none
+          restore-keys: alarm-state-
+
+      - name: Yokla ve gerekirse Telegram'a yaz
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_READ_KEY_ID: ${{ secrets.R2_READ_KEY_ID }}
+          R2_READ_SECRET: ${{ secrets.R2_READ_SECRET }}
+          TEST_MESAJI: ${{ inputs.test_mesaji }}
+        run: |
+          mkdir -p alarm-state
+          export STATE="$PWD/alarm-state/state.env"
+          cp "$STATE" "$RUNNER_TEMP/state.before" 2>/dev/null || : > "$RUNNER_TEMP/state.before"
+          #!/usr/bin/env bash
+          # Serva çalışma süresi alarmı. Sır DEĞERİ yazdırılmaz. Durum: $STATE (key=value dosyası).
+          set -u; set +e +o pipefail
+          SITE="${SITE:-https://servamenu.com}"
+          DEMO="${DEMO:-https://servano.servamenu.com/menu/mnu_TCy0MyMyvf_XENtu0TmtcA?locale=tr}"
+          AR_FILE="${AR_FILE:-https://media.servamenu.com/servano/models/servano-29cm-v4.glb}"
+          STATE="${STATE:-alarm-state.env}"
+          FAILS_TO_ALARM="${FAILS_TO_ALARM:-2}"
+          REMIND_SECONDS="${REMIND_SECONDS:-21600}"
+          BACKUP_MAX_HOURS="${BACKUP_MAX_HOURS:-26}"
+          NOW="$(date +%s)"
+
+          STATUS=UP; FAILS=0; DOWN_SINCE=0; LAST_NOTIFY=0; BACKUP_ALERT=0
+          [ -f "$STATE" ] && . "$STATE"
+          OLD_STATE="$(cat "$STATE" 2>/dev/null || true)"
+
+          CAN_SEND=1
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            CAN_SEND=0
+            echo "::notice::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID tanımlı değil: yoklama yapılır, mesaj gönderilmez."
+          fi
+
+          send() {
+            [ "$CAN_SEND" = 1 ] || { echo "(mesaj gönderilmedi, sır yok): $1"; return 0; }
+            curl -sS --max-time 20 -o /dev/null -f \
+              "${TELEGRAM_API:-https://api.telegram.org}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=$1" --data-urlencode "disable_web_page_preview=true"
+          }
+
+          if [ "${TEST_MESAJI:-}" = true ]; then
+            if [ "$CAN_SEND" = 1 ]; then
+              send "✅ Serva alarm testi: Telegram bağlantısı çalışıyor." && echo "Deneme mesajı gönderildi." || { echo "::error::Deneme mesajı gönderilemedi (belirteç ya da sohbet kimliği yanlış)."; exit 1; }
+            else
+              echo "::error::Deneme istendi ama TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID sırları tanımlı değil."; exit 1
+            fi
+          fi
+
+          PROBLEMS=""
+          fail() { PROBLEMS="${PROBLEMS}• $1"$'\n'; echo "KIRMIZI: $1"; }
+          ok()   { echo "TAMAM:   $1"; }
+
+          # kod_al URL [ek curl argümanları]: HTTP kodunu yazar (bağlanamazsa 000). Bir kez yeniden dener.
+          kod_al() {
+            local u="$1"; shift
+            local c
+            c="$(curl -s -o /tmp/govde -w '%{http_code}' --max-time 20 -A 'serva-alarm/1.0' "$@" "$u" 2>/dev/null)" || c=000
+            if [ "$c" = 000 ] || [ "${c:0:1}" = 5 ]; then sleep 5
+              c="$(curl -s -o /tmp/govde -w '%{http_code}' --max-time 20 -A 'serva-alarm/1.0' "$@" "$u" 2>/dev/null)" || c=000
+            fi
+            echo "$c"
+          }
+
+          # 1) Sağlık: önce veritabanına bakan uç; henüz yayında değilse düz sağlık ucu.
+          c="$(kod_al "$SITE/api/health/derin")"
+          if [ "$c" = 404 ]; then
+            c="$(kod_al "$SITE/api/health")"
+            if [ "$c" = 200 ] && grep -q '"status":"ok"' /tmp/govde; then ok "sağlık (düz uç; /derin henüz yayında değil)"; else fail "Sağlık ucu: kod $c"; fi
+          elif [ "$c" = 200 ] && grep -q '"status":"ok"' /tmp/govde; then ok "sağlık + veritabanı"
+          elif [ "$c" = 503 ]; then fail "Veritabanı yanıt vermiyor (sağlık ucu 503)"
+          else fail "Sağlık ucu: kod $c"; fi
+
+          # 2) Ana sayfa
+          c="$(kod_al "$SITE/")"; [ "$c" = 200 ] && ok "ana sayfa" || fail "Ana sayfa: kod $c"
+
+          # 3) Demo menü
+          c="$(kod_al "$DEMO")"; [ "$c" = 200 ] && ok "demo menü" || fail "Demo menü (servano.servamenu.com): kod $c"
+
+          # 4) Gerçek AR dosyası: sitenin kendi bilet ucundan bilet al, dosyanın ilk 100 baytını iste.
+          ar_kontrol() {
+            local bilet
+            bilet="$(curl -s --max-time 20 -X POST "$SITE/api/media-ticket" -H "Origin: $SITE" -H 'Content-Type: application/json' \
+              -d "{\"urls\":[\"$AR_FILE\"]}" | grep -o 'https://[^"]*' | tail -1)"
+            [ -n "$bilet" ] || { echo "bilet alınamadı"; return 1; }
+            local k; k="$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 -r 0-99 "$bilet")"
+            { [ "$k" = 206 ] || [ "$k" = 200 ]; } && return 0
+            echo "dosya kodu $k"; return 1
+          }
+          if r="$(ar_kontrol)"; then ok "AR dosyası"; else sleep 5; if r="$(ar_kontrol)"; then ok "AR dosyası"; else fail "AR dosyası açılmıyor ($r)"; fi; fi
+
+          # ---- Durum makinesi (2 ardışık başarısızlıkta DÜŞTÜ, düzelince DÜZELDİ) ----
+          MESAJ_HATA=0
+          if [ -n "$PROBLEMS" ]; then
+            FAILS=$((FAILS + 1))
+            if [ "$FAILS" -ge "$FAILS_TO_ALARM" ]; then
+              if [ "$STATUS" = UP ]; then
+                send "🔴 SERVA DÜŞTÜ ($(date -u +%H:%M) UTC)"$'\n'"$PROBLEMS"$'\n'"İlk 5 dakika: durum.cmd, sonra Coolify > Restart, olmazsa geri-al.cmd (EL-KITABI)." || MESAJ_HATA=1
+                if [ "$MESAJ_HATA" = 0 ]; then STATUS=DOWN; DOWN_SINCE=$NOW; LAST_NOTIFY=$NOW; fi
+              elif [ $((NOW - LAST_NOTIFY)) -ge "$REMIND_SECONDS" ]; then
+                send "🔴 SERVA HÂLÂ DÜŞÜK ($(( (NOW - DOWN_SINCE) / 60 )) dk)"$'\n'"$PROBLEMS" || MESAJ_HATA=1
+                [ "$MESAJ_HATA" = 0 ] && LAST_NOTIFY=$NOW
+              fi
+            fi
+          else
+            if [ "$STATUS" = DOWN ]; then
+              send "🟢 SERVA DÜZELDİ ($(date -u +%H:%M) UTC). Kesinti yaklaşık $(( (NOW - DOWN_SINCE) / 60 )) dakika sürdü." || MESAJ_HATA=1
+              if [ "$MESAJ_HATA" = 0 ]; then STATUS=UP; DOWN_SINCE=0; FAILS=0; fi
+            else FAILS=0; fi
+          fi
+
+          # ---- İsteğe bağlı: gece yedeği tazeliği (yalnız R2 okuma anahtarı varsa) ----
+          if [ -n "${R2_ACCOUNT_ID:-}" ] && [ -n "${R2_READ_KEY_ID:-}" ] && [ -n "${R2_READ_SECRET:-}" ]; then
+            export AWS_ACCESS_KEY_ID="$R2_READ_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_READ_SECRET" AWS_DEFAULT_REGION=auto
+            son="$(aws s3 ls "s3://${R2_BUCKET:-serva-backups}/${R2_PREFIX:-db}/" --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" 2>/dev/null | awk '{print $1" "$2}' | sort | tail -1)"
+            if [ -z "$son" ]; then
+              echo "Yedek listesi okunamadı (anahtar/kova adı?)"
+            else
+              sonsn="$(date -u -d "$son" +%s 2>/dev/null || echo 0)"
+              yas=$(( (NOW - sonsn) / 3600 ))
+              if [ "$sonsn" -gt 0 ] && [ "$yas" -ge "$BACKUP_MAX_HOURS" ]; then
+                if [ "$BACKUP_ALERT" = 0 ]; then
+                  send "🟠 SERVA YEDEK ESKİ: son veritabanı yedeği $yas saat önce ($son UTC). Gece 03:30 yedeği alınmamış olabilir. EL-KITABI bölüm 7." && BACKUP_ALERT=1
+                fi
+              else
+                if [ "$BACKUP_ALERT" = 1 ]; then send "🟢 Serva yedeği yeniden güncel (son: $son UTC)." && BACKUP_ALERT=0; fi
+                echo "TAMAM:   yedek $yas saat önce"
+              fi
+            fi
+          else
+            echo "(yedek yoklaması atlandı: R2 okuma sırları tanımlı değil)"
+          fi
+
+          printf 'STATUS=%s\nFAILS=%s\nDOWN_SINCE=%s\nLAST_NOTIFY=%s\nBACKUP_ALERT=%s\n' "$STATUS" "$FAILS" "$DOWN_SINCE" "$LAST_NOTIFY" "$BACKUP_ALERT" > "$STATE"
+          echo "durum: $STATUS, ardışık başarısız: $FAILS"
+          [ "$MESAJ_HATA" = 0 ] || { echo "::error::Telegram mesajı gönderilemedi (belirteç/sohbet kimliği yanlış olabilir)."; exit 1; }
+          # Onaylı kesinti sürerken çalıştırma kırmızı olur: GitHub'ın e-postası ikinci kanal.
+          if [ "$STATUS" = DOWN ] && [ "$CAN_SEND" = 1 ]; then exit 1; fi
+          exit 0
+
+      - name: Durum değiştiyse kaydet
+        id: degisti
+        if: always()
+        run: |
+          if cmp -s alarm-state/state.env "$RUNNER_TEMP/state.before"; then echo changed=false >> "$GITHUB_OUTPUT"; else echo changed=true >> "$GITHUB_OUTPUT"; fi
+
+      - name: Durumu önbelleğe yaz
+        if: always() && steps.degisti.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: alarm-state/state.env
+          key: alarm-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Zamanlamayı canlı tut (60 gün kuralı)
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/uptime-alarm.yml/enable"
